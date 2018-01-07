@@ -1,0 +1,6 @@
+[package]
+name = "racecar"
+version = "0.0.0"
+
+[dependencies]
+encoding = "0.2.33"
