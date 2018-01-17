@@ -1,86 +1,142 @@
+use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::env;
 use std::fs::File;
 use std::io::Read;
-use std::path::Path;
 use std::time::Instant;
 
 fn main() {
-    let arg = env::args().nth(1).unwrap();
-    let path = Path::new(&arg);
-    let mut file = File::open(path).unwrap();
     let mut bytes = Vec::new();
-    let size = file.read_to_end(&mut bytes).unwrap();
-    let mut decoder = Decoder::new(&bytes);
+    File::open(env::args().nth(1).unwrap())
+        .unwrap()
+        .read_to_end(&mut bytes)
+        .unwrap();
+    let size = bytes.len();
+    let size_mb = usize_f64(size) / 1_048_576.;
+
     let start = Instant::now();
-    let result = decoder.get_replay();
+    let result = Get::new(bytes).get_replay();
     let elapsed = start.elapsed();
-    let duration = (elapsed.as_secs() * 1_000_000) + u64::from(elapsed.subsec_nanos());
-    println!(
-        "{} {:>7} B {:>9} ns {:>8.1} B/s",
-        match result {
-            Ok(_) => "pass",
-            Err(_) => "fail",
-        },
-        size,
-        duration,
-        (1_000_000 * size) as f64 / duration as f64,
+    let elapsed_ms =
+        u64_f64(1_000_000_000 * elapsed.as_secs() + u32_u64(elapsed.subsec_nanos())) / 1_000_000.;
+
+    let rate = 1_000. * size_mb / elapsed_ms;
+    eprintln!(
+        "Parsed {:.3} MB in {:.3} ms at {:.3} MB/s.",
+        size_mb, elapsed_ms, rate
     );
-    println!("{:#?}", result);
-}
 
-#[derive(Debug)]
-pub struct Replay {
-    pub header: Section<Header>,
-    pub content: Section<Content>,
-}
-
-impl Decoder {
-    pub fn get_replay(&mut self) -> DecoderResult<Replay> {
-        let header = self.get_section(Self::get_header)?;
-        let content = self.get_section(Self::get_content)?;
-        Ok(Replay { header, content })
+    match result {
+        Err(problem) => eprintln!("{:#?}", problem),
+        Ok(replay) => println!("{:#?}", replay.content.value.frames.get(0)),
     }
 }
 
+type GetResult<T> = Result<T, GetError>;
+
 #[derive(Debug)]
-pub struct Section<T> {
-    pub size: u32,
-    pub crc: u32,
-    pub value: T,
+enum GetError {
+    BitGet(BitGetError),
+    ChecksumMismatch { expected: u32, actual: u32 },
+    IndexOutOfBounds { index: usize, len: usize },
+    InvalidUtf16(Vec<u8>),
+    InvalidWindows1252(Vec<u8>),
+    UnknownProperty(String),
 }
 
-impl Decoder {
-    pub fn get_section<T>(&mut self, get_value: DecoderFn<T>) -> DecoderResult<Section<T>> {
-        let size = self.get_u32()?;
-        let crc = self.get_u32()?;
-        self.check_crc(size as usize, crc)?;
-        let value = get_value(self)?;
-        Ok(Section { size, crc, value })
-    }
+struct Get {
+    bytes: Vec<u8>,
+    index: usize,
+}
 
-    pub fn check_crc(&self, size: usize, crc: u32) -> DecoderResult<()> {
-        let bytes = self.peek_bytes(size)?;
-        let actual = compute_crc_32(&bytes);
-        if actual != crc {
-            Err(DecoderError::InvalidCrc {
-                expected: crc,
-                actual,
-            })
-        } else {
-            Ok(())
+impl Get {
+    fn new(bytes: Vec<u8>) -> Self {
+        Self { bytes, index: 0 }
+    }
+}
+
+type BitGetResult<T> = Result<T, BitGetError>;
+
+#[derive(Debug)]
+enum BitGetError {
+    IndexOutOfBounds { index: usize, len: usize },
+    NotImplemented,
+    UnknownActor(u32),
+    UnknownNameIndex(u32),
+    UnknownObjectClass(u32),
+    UnknownObjectIndex(u32),
+}
+
+struct BitGet {
+    bytes: Vec<u8>,
+    byte_index: usize,
+    bit_index: usize,
+}
+
+impl BitGet {
+    fn new(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            byte_index: 0,
+            bit_index: 0,
         }
     }
 }
 
 #[derive(Debug)]
-pub struct Header {
-    pub version: Version,
-    pub label: Text,
-    pub properties: Dictionary<Property>,
+struct Replay {
+    header: Section<Header>,
+    content: Section<Content>,
 }
 
-impl Decoder {
-    pub fn get_header(&mut self) -> DecoderResult<Header> {
+impl Get {
+    fn get_replay(&mut self) -> GetResult<Replay> {
+        let header = self.get_section(Self::get_header)?;
+        let content = self.get_section(|this| this.get_content(&header.value))?;
+        Ok(Replay { header, content })
+    }
+}
+
+#[derive(Debug)]
+struct Section<T> {
+    size: u32,
+    crc: u32,
+    value: T,
+}
+
+impl Get {
+    fn get_section<F, T>(&mut self, get_value: F) -> GetResult<Section<T>>
+    where
+        F: Fn(&mut Self) -> GetResult<T>,
+    {
+        let size = self.get_u32()?;
+        let crc = self.get_u32()?;
+        self.check_crc_32(size, crc)?;
+        let value = get_value(self)?;
+        Ok(Section { size, crc, value })
+    }
+
+    fn check_crc_32(&self, size: u32, expected: u32) -> GetResult<()> {
+        let bytes = self.peek_vec(u32_usize(size))?;
+        let actual = crc_32(&bytes);
+        if actual == expected {
+            Ok(())
+        } else {
+            Err(GetError::ChecksumMismatch { expected, actual })
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Header {
+    version: Version,
+    label: Text,
+    properties: Dictionary<Property>,
+}
+
+impl Get {
+    fn get_header(&mut self) -> GetResult<Header> {
         let version = self.get_version()?;
         let label = self.get_text()?;
         let properties = self.get_dictionary(Self::get_property)?;
@@ -93,17 +149,17 @@ impl Decoder {
 }
 
 #[derive(Debug)]
-pub struct Version {
-    pub major: u32,
-    pub minor: u32,
-    pub patch: Option<u32>,
+struct Version {
+    major: u32,
+    minor: u32,
+    patch: Option<u32>,
 }
 
-impl Decoder {
-    pub fn get_version(&mut self) -> DecoderResult<Version> {
+impl Get {
+    fn get_version(&mut self) -> GetResult<Version> {
         let major = self.get_u32()?;
         let minor = self.get_u32()?;
-        let patch = self.get_option(major >= 868 && minor >= 18, Self::get_u32)?;
+        let patch = self.get_option((major, minor) >= (868, 18), Self::get_u32)?;
         Ok(Version {
             major,
             minor,
@@ -113,83 +169,76 @@ impl Decoder {
 }
 
 #[derive(Debug)]
-pub struct Text {
-    pub size: i32,
-    pub value: String,
+struct Text {
+    size: i32,
+    value: String,
 }
 
-impl Decoder {
-    pub fn get_text(&mut self) -> DecoderResult<Text> {
+impl Get {
+    fn get_text(&mut self) -> GetResult<Text> {
         let size = self.get_i32()?;
-        let value = if size < 0 {
-            self.get_utf_16((-2 * size) as usize)
+        if size < 0 {
+            let bytes = self.get_vec(i32_usize(-2 * size))?;
+            match utf_16(&bytes) {
+                None => Err(GetError::InvalidUtf16(bytes)),
+                Some(value) => Ok(Text { size, value }),
+            }
         } else {
-            self.get_windows_1252(size as usize)
-        }?;
-        Ok(Text { size, value })
-    }
-
-    pub fn get_utf_16(&mut self, size: usize) -> DecoderResult<String> {
-        let bytes = self.get_bytes(size)?;
-        match decode_utf_16(&bytes) {
-            Some(string) => Ok(string),
-            None => Err(DecoderError::InvalidUtf16(bytes)),
-        }
-    }
-
-    pub fn get_windows_1252(&mut self, size: usize) -> DecoderResult<String> {
-        let bytes = self.get_bytes(size)?;
-        match decode_windows_1252(&bytes) {
-            Some(string) => Ok(string),
-            None => Err(DecoderError::InvalidWindows1252(bytes)),
+            let size = if size == 0x0500_0000 { 8 } else { size };
+            let bytes = self.get_vec(i32_usize(size))?;
+            match windows_1252(&bytes) {
+                None => Err(GetError::InvalidWindows1252(bytes)),
+                Some(value) => Ok(Text { size, value }),
+            }
         }
     }
 }
 
 #[derive(Debug)]
-pub struct Dictionary<T> {
-    pub value: Vec<(Text, T)>,
-    pub last: Text,
+struct Dictionary<T> {
+    value: Vec<(Text, T)>,
+    last: Text,
 }
 
-impl Decoder {
-    pub fn get_dictionary<T>(&mut self, get_value: DecoderFn<T>) -> DecoderResult<Dictionary<T>> {
+impl Get {
+    fn get_dictionary<F, T>(&mut self, get_value: F) -> GetResult<Dictionary<T>>
+    where
+        F: Fn(&mut Self) -> GetResult<T>,
+    {
         let mut value = Vec::new();
         let last = loop {
             let k = self.get_text()?;
-            match k.value.as_str() {
-                "None\0" => break k,
-                _ => {
-                    let v = get_value(self)?;
-                    value.push((k, v))
-                }
+            if k.value.as_str() == "None\0" || k.value.as_str() == "\0\0\0None\0" {
+                break k;
             }
+            let v = get_value(self)?;
+            value.push((k, v))
         };
         Ok(Dictionary { value, last })
     }
 }
 
 #[derive(Debug)]
-pub struct Property {
-    pub label: Text,
-    pub size: u64,
-    pub value: PropertyValue<Property>,
+struct Property {
+    label: Text,
+    size: u64,
+    value: PropertyValue,
 }
 
-impl Decoder {
-    pub fn get_property(&mut self) -> DecoderResult<Property> {
+impl Get {
+    fn get_property(&mut self) -> GetResult<Property> {
         let label = self.get_text()?;
         let size = self.get_u64()?;
-        let value = self.get_property_value(&label.value, Self::get_property)?;
+        let value = self.get_property_value(label.value.as_str())?;
         Ok(Property { label, size, value })
     }
 }
 
 #[derive(Debug)]
-pub enum PropertyValue<T> {
-    Array(List<Dictionary<T>>),
+enum PropertyValue {
+    Array(List<Dictionary<Property>>),
     Bool(u8),
-    Byte(Text, Option<Text>),
+    Byte { key: Text, value: Option<Text> },
     Float(f32),
     Int(u32),
     Name(Text),
@@ -197,14 +246,10 @@ pub enum PropertyValue<T> {
     Str(Text),
 }
 
-impl Decoder {
-    pub fn get_property_value<T>(
-        &mut self,
-        label: &str,
-        get_value: DecoderFn<T>,
-    ) -> DecoderResult<PropertyValue<T>> {
+impl Get {
+    fn get_property_value(&mut self, label: &str) -> GetResult<PropertyValue> {
         match label {
-            "ArrayProperty\0" => self.get_property_value_array(get_value),
+            "ArrayProperty\0" => self.get_property_value_array(),
             "BoolProperty\0" => self.get_property_value_bool(),
             "ByteProperty\0" => self.get_property_value_byte(),
             "FloatProperty\0" => self.get_property_value_float(),
@@ -212,73 +257,70 @@ impl Decoder {
             "NameProperty\0" => self.get_property_value_name(),
             "QWordProperty\0" => self.get_property_value_qword(),
             "StrProperty\0" => self.get_property_value_str(),
-            _ => Err(DecoderError::UnknownProperty(String::from(label))),
+            _ => Err(GetError::UnknownProperty(String::from(label))),
         }
     }
 
-    pub fn get_property_value_array<T>(
-        &mut self,
-        get_value: DecoderFn<T>,
-    ) -> DecoderResult<PropertyValue<T>> {
-        let x = self.get_list(|this| this.get_dictionary(get_value))?;
+    fn get_property_value_array(&mut self) -> GetResult<PropertyValue> {
+        let x = self.get_list(|this| this.get_dictionary(|that| that.get_property()))?;
         Ok(PropertyValue::Array(x))
     }
 
-    pub fn get_property_value_bool<T>(&mut self) -> DecoderResult<PropertyValue<T>> {
+    fn get_property_value_bool(&mut self) -> GetResult<PropertyValue> {
         let x = self.get_u8()?;
         Ok(PropertyValue::Bool(x))
     }
 
-    pub fn get_property_value_byte<T>(&mut self) -> DecoderResult<PropertyValue<T>> {
+    fn get_property_value_byte(&mut self) -> GetResult<PropertyValue> {
         let key = self.get_text()?;
-        let value = if key.value == "OnlinePlatform_Steam\0" {
+        let value = if key.value.as_str() == "OnlinePlatform_Steam\0" {
             Ok(None)
         } else {
             let x = self.get_text()?;
             Ok(Some(x))
         }?;
-        Ok(PropertyValue::Byte(key, value))
+        Ok(PropertyValue::Byte { key, value })
     }
 
-    pub fn get_property_value_float<T>(&mut self) -> DecoderResult<PropertyValue<T>> {
+    fn get_property_value_float(&mut self) -> GetResult<PropertyValue> {
         let x = self.get_f32()?;
         Ok(PropertyValue::Float(x))
     }
 
-    pub fn get_property_value_int<T>(&mut self) -> DecoderResult<PropertyValue<T>> {
+    fn get_property_value_int(&mut self) -> GetResult<PropertyValue> {
         let x = self.get_u32()?;
         Ok(PropertyValue::Int(x))
     }
 
-    pub fn get_property_value_name<T>(&mut self) -> DecoderResult<PropertyValue<T>> {
+    fn get_property_value_name(&mut self) -> GetResult<PropertyValue> {
         let x = self.get_text()?;
         Ok(PropertyValue::Name(x))
     }
 
-    pub fn get_property_value_qword<T>(&mut self) -> DecoderResult<PropertyValue<T>> {
+    fn get_property_value_qword(&mut self) -> GetResult<PropertyValue> {
         let x = self.get_u64()?;
         Ok(PropertyValue::QWord(x))
     }
 
-    pub fn get_property_value_str<T>(&mut self) -> DecoderResult<PropertyValue<T>> {
+    fn get_property_value_str(&mut self) -> GetResult<PropertyValue> {
         let x = self.get_text()?;
         Ok(PropertyValue::Str(x))
     }
 }
 
 #[derive(Debug)]
-pub struct List<T> {
-    pub size: u32,
-    pub value: Vec<T>,
+struct List<T> {
+    size: u32,
+    value: Vec<T>,
 }
 
-impl Decoder {
-    pub fn get_list<F, T>(&mut self, get_value: F) -> DecoderResult<List<T>>
+impl Get {
+    fn get_list<F, T>(&mut self, get_value: F) -> GetResult<List<T>>
     where
-        F: Fn(&mut Self) -> DecoderResult<T>,
+        F: Fn(&mut Self) -> GetResult<T>,
     {
         let size = self.get_u32()?;
-        let mut value = Vec::with_capacity(size as usize);
+        let mut value = Vec::with_capacity(u32_usize(size));
         for _ in 0..size {
             let x = get_value(self)?;
             value.push(x)
@@ -288,337 +330,579 @@ impl Decoder {
 }
 
 #[derive(Debug)]
-pub struct Content {
-    pub levels: List<Text>,
-    pub keyframes: List<Keyframe>,
-    pub frames: Vec<Frame>,
-    pub messages: List<Message>,
-    pub marks: List<Mark>,
-    pub packages: List<Text>,
-    pub objects: List<Text>,
-    pub names: List<Text>,
-    pub classes: List<Class>,
-    pub caches: List<Cache>,
+struct Content {
+    levels: List<Text>,
+    keyframes: List<Keyframe>,
+    size: u32,
+    messages: List<Message>,
+    marks: List<Mark>,
+    packages: List<Text>,
+    objects: List<Text>,
+    names: List<Text>,
+    classes: List<Class>,
+    caches: List<Cache>,
+    frames: Vec<Frame>,
 }
 
-impl Decoder {
-    pub fn get_content(&mut self) -> DecoderResult<Content> {
-        Err(DecoderError::NotImplemented)
+impl Get {
+    fn get_content(&mut self, header: &Header) -> GetResult<Content> {
+        let levels = self.get_list(Self::get_text)?;
+        let keyframes = self.get_list(Self::get_keyframe)?;
+        let size = self.get_u32()?;
+        let bytes = self.get_vec(u32_usize(size))?;
+        let messages = self.get_list(Self::get_message)?;
+        let marks = self.get_list(Self::get_mark)?;
+        let packages = self.get_list(Self::get_text)?;
+        let objects = self.get_list(Self::get_text)?;
+        let names = self.get_list(Self::get_text)?;
+        let classes = self.get_list(Self::get_class)?;
+        let caches = self.get_list(Self::get_cache)?;
+        let frames =
+            Self::get_frames(bytes, &mut Context::new(header, &names, &objects, &classes))?;
+        Ok(Content {
+            levels,
+            keyframes,
+            size,
+            messages,
+            marks,
+            packages,
+            objects,
+            names,
+            classes,
+            caches,
+            frames,
+        })
     }
 }
 
 #[derive(Debug)]
-pub struct Keyframe {
-    pub time: f32,
-    pub frame: u32,
-    pub offset: u32,
+struct Keyframe {
+    time: f32,
+    frame: u32,
+    offset: u32,
+}
+
+impl Get {
+    fn get_keyframe(&mut self) -> GetResult<Keyframe> {
+        let time = self.get_f32()?;
+        let frame = self.get_u32()?;
+        let offset = self.get_u32()?;
+        Ok(Keyframe {
+            time,
+            frame,
+            offset,
+        })
+    }
 }
 
 #[derive(Debug)]
-pub struct Frame {
-    pub time: f32,
-    pub delta: f32,
-    pub replications: Vec<Replication>,
+struct Message {
+    frame: u32,
+    label: Text,
+    value: Text,
+}
+
+impl Get {
+    fn get_message(&mut self) -> GetResult<Message> {
+        let frame = self.get_u32()?;
+        let label = self.get_text()?;
+        let value = self.get_text()?;
+        Ok(Message {
+            frame,
+            label,
+            value,
+        })
+    }
 }
 
 #[derive(Debug)]
-pub struct Replication {
-    pub actor: U32C,
-    pub value: ReplicationValue,
+struct Mark {
+    value: Text,
+    frame: u32,
+}
+
+impl Get {
+    fn get_mark(&mut self) -> GetResult<Mark> {
+        let value = self.get_text()?;
+        let frame = self.get_u32()?;
+        Ok(Mark { value, frame })
+    }
 }
 
 #[derive(Debug)]
-pub struct U32C {
-    pub limit: u32,
-    pub value: u32,
+struct Class {
+    name: Text,
+    id: u32,
+}
+
+impl Get {
+    fn get_class(&mut self) -> GetResult<Class> {
+        let name = self.get_text()?;
+        let id = self.get_u32()?;
+        Ok(Class { name, id })
+    }
 }
 
 #[derive(Debug)]
-pub enum ReplicationValue {
+struct Cache {
+    class: u32,
+    parent: u32,
+    index: u32,
+    objects: List<Object>,
+}
+
+impl Get {
+    fn get_cache(&mut self) -> GetResult<Cache> {
+        let class = self.get_u32()?;
+        let parent = self.get_u32()?;
+        let index = self.get_u32()?;
+        let objects = self.get_list(Self::get_object)?;
+        Ok(Cache {
+            class,
+            parent,
+            index,
+            objects,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct Object {
+    index: u32,
+    id: u32,
+}
+
+impl Get {
+    fn get_object(&mut self) -> GetResult<Object> {
+        let index = self.get_u32()?;
+        let id = self.get_u32()?;
+        Ok(Object { index, id })
+    }
+}
+
+struct Context {
+    num_frames: usize,
+    max_channels: u32,
+    version: (u32, u32, u32),
+    names: Vec<String>,
+    objects: Vec<String>,
+    classes: BTreeMap<u32, String>,
+    classes_with_location: HashSet<&'static str>,
+    classes_with_rotation: HashSet<&'static str>,
+    actors: HashMap<u32, u32>,
+}
+
+impl Context {
+    fn new(
+        header: &Header,
+        names: &List<Text>,
+        objects: &List<Text>,
+        classes: &List<Class>,
+    ) -> Self {
+        Context {
+            num_frames: Self::get_num_frames(header),
+            max_channels: Self::get_max_channels(header),
+            version: Self::get_version(header),
+            names: Self::get_names(names),
+            objects: Self::get_objects(objects),
+            classes: Self::get_classes(classes),
+            classes_with_location: Self::get_classes_with_location(),
+            classes_with_rotation: Self::get_classes_with_rotation(),
+            actors: HashMap::new(),
+        }
+    }
+
+    fn get_num_frames(header: &Header) -> usize {
+        match header
+            .properties
+            .value
+            .iter()
+            .find(|property| property.0.value.as_str() == "NumFrames\0")
+        {
+            Some(&(
+                _,
+                Property {
+                    value: PropertyValue::Int(num_frames),
+                    ..
+                },
+            )) => u32_usize(num_frames),
+            _ => 0,
+        }
+    }
+
+    fn get_max_channels(header: &Header) -> u32 {
+        match header
+            .properties
+            .value
+            .iter()
+            .find(|property| property.0.value.as_str() == "MaxChannels\0")
+        {
+            Some(&(
+                _,
+                Property {
+                    value: PropertyValue::Int(max_channels),
+                    ..
+                },
+            )) => max_channels,
+            _ => 1_023,
+        }
+    }
+
+    fn get_version(header: &Header) -> (u32, u32, u32) {
+        (
+            header.version.major,
+            header.version.minor,
+            header.version.patch.unwrap_or(0),
+        )
+    }
+
+    fn get_names(names: &List<Text>) -> Vec<String> {
+        names.value.iter().map(|name| name.value.clone()).collect()
+    }
+
+    fn get_objects(objects: &List<Text>) -> Vec<String> {
+        objects
+            .value
+            .iter()
+            .map(|object| object.value.clone())
+            .collect()
+    }
+
+    fn get_classes(classes: &List<Class>) -> BTreeMap<u32, String> {
+        classes
+            .value
+            .iter()
+            .map(|class| (class.id, class.name.value.clone()))
+            .collect()
+    }
+
+    fn get_classes_with_location() -> HashSet<&'static str> {
+        [
+            "TAGame.Ball_Breakout_TA\0",
+            "TAGame.Ball_TA\0",
+            "TAGame.CameraSettingsActor_TA\0",
+            "TAGame.Car_Season_TA\0",
+            "TAGame.Car_TA\0",
+            "TAGame.CarComponent_Boost_TA\0",
+            "TAGame.CarComponent_Dodge_TA\0",
+            "TAGame.CarComponent_DoubleJump_TA\0",
+            "TAGame.CarComponent_FlipCar_TA\0",
+            "TAGame.CarComponent_Jump_TA\0",
+            "TAGame.GameEvent_Season_TA\0",
+            "TAGame.GameEvent_Soccar_TA\0",
+            "TAGame.GameEvent_SoccarPrivate_TA\0",
+            "TAGame.GameEvent_SoccarSplitscreen_TA\0",
+            "TAGame.GRI_TA\0",
+            "TAGame.PRI_TA\0",
+            "TAGame.SpecialPickup_BallCarSpring_TA\0",
+            "TAGame.SpecialPickup_BallFreeze_TA\0",
+            "TAGame.SpecialPickup_BallGravity_TA\0",
+            "TAGame.SpecialPickup_BallLasso_TA\0",
+            "TAGame.SpecialPickup_BallVelcro_TA\0",
+            "TAGame.SpecialPickup_Batarang_TA\0",
+            "TAGame.SpecialPickup_BoostOverride_TA\0",
+            "TAGame.SpecialPickup_GrapplingHook_TA\0",
+            "TAGame.SpecialPickup_HitForce_TA\0",
+            "TAGame.SpecialPickup_Swapper_TA\0",
+            "TAGame.SpecialPickup_Tornado_TA\0",
+            "TAGame.Team_Soccar_TA\0",
+        ].iter()
+            .cloned()
+            .collect()
+    }
+
+    fn has_location(&self, class: &str) -> bool {
+        self.classes_with_location.contains(class)
+    }
+
+    fn get_classes_with_rotation() -> HashSet<&'static str> {
+        [
+            "TAGame.Ball_Breakout_TA\0",
+            "TAGame.Ball_TA\0",
+            "TAGame.Car_Season_TA\0",
+            "TAGame.Car_TA\0",
+        ].iter()
+            .cloned()
+            .collect()
+    }
+
+    fn has_rotation(&self, class: &str) -> bool {
+        self.classes_with_rotation.contains(class)
+    }
+
+    fn get_actor_class_id(&self, actor: u32) -> Option<u32> {
+        match self.actors.get(&actor) {
+            None => None,
+            Some(&id) => Some(id),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Frame {
+    time: f32,
+    delta: f32,
+    replications: Vec<Replication>,
+}
+
+impl Get {
+    fn get_frames(bytes: Vec<u8>, context: &mut Context) -> GetResult<Vec<Frame>> {
+        match BitGet::new(bytes).get_frames(context) {
+            Err(problem) => Err(GetError::BitGet(problem)),
+            Ok(frames) => Ok(frames),
+        }
+    }
+}
+
+impl BitGet {
+    fn get_frames(&mut self, context: &mut Context) -> BitGetResult<Vec<Frame>> {
+        let mut frames = Vec::with_capacity(context.num_frames);
+        for _ in 0..context.num_frames {
+            let frame = self.get_frame(context)?;
+            frames.push(frame)
+        }
+        Ok(frames)
+    }
+
+    fn get_frame(&mut self, context: &mut Context) -> BitGetResult<Frame> {
+        let time = self.get_f32()?;
+        let delta = self.get_f32()?;
+        let replications = self.get_replications(context)?;
+        Ok(Frame {
+            time,
+            delta,
+            replications,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct Replication {
+    actor: U32C,
+    value: ReplicationValue,
+}
+
+impl BitGet {
+    fn get_replications(&mut self, context: &mut Context) -> BitGetResult<Vec<Replication>> {
+        let mut replications = Vec::new();
+        loop {
+            let has_more = self.get_bool()?;
+            if has_more {
+                let replication = self.get_replication(context)?;
+                replications.push(replication)
+            } else {
+                break;
+            }
+        }
+        Ok(replications)
+    }
+
+    fn get_replication(&mut self, context: &mut Context) -> BitGetResult<Replication> {
+        let actor = self.get_u32c(context.max_channels)?;
+        let value = self.get_replication_value(context, actor.value)?;
+        if let ReplicationValue::Created { class_id, .. } = value {
+            match context.actors.insert(actor.value, class_id) {
+                _ => (),
+            }
+        }
+        Ok(Replication { actor, value })
+    }
+}
+
+#[derive(Debug)]
+struct U32C {
+    limit: u32,
+    value: u32,
+}
+
+impl BitGet {
+    fn get_u32c(&mut self, limit: u32) -> BitGetResult<U32C> {
+        let mut value = 0;
+        let max_index = (limit as f32).log2().ceil() as u32;
+        let mut index = 0;
+        loop {
+            let step = 1 << index;
+            let next_value = value + step;
+            if index >= max_index || next_value > limit {
+                break;
+            }
+            let flag = self.get_bool()?;
+            if flag {
+                value = next_value;
+            }
+            index += 1;
+        }
+        Ok(U32C { limit, value })
+    }
+}
+
+#[derive(Debug)]
+enum ReplicationValue {
     Created {
         unknown: bool,
         name_index: Option<u32>,
-        name: Option<Text>,
-        object_id: u32,
-        object: Text,
-        class: Text,
-        location: Option<Point<i32>>,
-        rotation: Option<Point<Option<i8>>>,
+        name: Option<String>, // RO
+        object_index: u32,
+        object: String, // RO
+        class_id: u32,  // RO
+        class: String,  // RO
+        location: Option<Location>,
+        rotation: Option<Rotation>,
     },
     Updated(Vec<Attribute>),
     Destroyed,
 }
 
-#[derive(Debug)]
-pub struct Point<T> {
-    pub x: T,
-    pub y: T,
-    pub z: T,
-}
-
-#[derive(Debug)]
-pub struct Attribute {
-    pub id: U32C,
-    pub name: Text,
-    pub value: AttributeValue,
-}
-
-#[derive(Debug)]
-pub enum AttributeValue {
-    AppliedDamage {
-        unknown1: u8,
-        location: Point<i32>,
-        unknown2: i32,
-        unknown3: i32,
-    },
-    Boolean(bool),
-    Byte(u8),
-    CamSettings {
-        fov: f32,
-        height: f32,
-        angle: f32,
-        distance: f32,
-        stiffness: f32,
-        swivel_speed: f32,
-        transition_speed: Option<f32>,
-    },
-    ClubColors {
-        unknown1: bool,
-        blue: u8,
-        unknown2: bool,
-        orange: u8,
-    },
-    DamageState {
-        unknown1: u8,
-        unknown2: bool,
-        unknown3: i32,
-        unknown4: Point<i32>,
-        unknown5: bool,
-        unknown6: bool,
-    },
-    Demolish {
-        unknown1: bool,
-        attacker_actor: u32,
-        unknown2: bool,
-        victim_actor: u32,
-        attacker_velocity: Point<i32>,
-        victim_velocity: Point<i32>,
-    },
-    Enum(u16),
-    Explosion(Explosion),
-    ExtendedExplosion {
-        explosion: Explosion,
-        unknown: FlaggedInt,
-    },
-    FlaggedInt(FlaggedInt),
-    Float(f32),
-    GameMode {
-        size: isize,
-        value: u8,
-    },
-    Int(i32),
-    Loadout(Loadout),
-    LoadoutOnline(LoadoutOnline),
-    Loadouts {
-        blue: Loadout,
-        orange: Loadout,
-    },
-    LoadoutsOnline {
-        blue: LoadoutOnline,
-        orange: LoadoutOnline,
-        unknown1: bool,
-        unknown2: bool,
-    },
-    Location(Point<i32>),
-    MusicStinger {
-        unknown: bool,
-        cue: u32,
-        trigger: u8,
-    },
-    PartyLeader {
-        system: u8,
-        id: Option<(RemoteId, u8)>,
-    },
-    Pickup {
-        instigator: Option<u32>,
-        picked_up: bool,
-    },
-    PlayerHistoryKey(Vec<bool>),
-    PrivateMatchSettings {
-        mutators: Text,
-        joinable_by: u32,
-        max_players: u32,
-        game_name: Text,
-        password: Text,
-        unknown: bool,
-    },
-    QWord(u64),
-    Reservation {
-        number: U32C,
-        id: UniqueId,
-        name: Option<Text>,
-        unknown1: bool,
-        unknown2: bool,
-        unknown3: Option<u8>,
-    },
-    RigidBodyState {
-        unknown: bool,
-        location: Point<i32>,
-        rotation: Point<U32C>,
-        linear_velocity: Option<Point<i32>>,
-        angular_velocity: Option<Point<i32>>,
-    },
-    String(Text),
-    TeamPaint {
-        team: u8,
-        primary_color: u8,
-        accent_color: u8,
-        primary_finish: u32,
-        accent_finish: u32,
-    },
-    UniqueId(UniqueId),
-    WeldedInfo {
-        active: bool,
+impl BitGet {
+    fn get_replication_value(
+        &mut self,
+        context: &Context,
         actor: u32,
-        offset: Point<i32>,
-        mass: f32,
-        rotation: Point<Option<i8>>,
-    },
-}
-
-#[derive(Debug)]
-pub struct Explosion {
-    pub unknown: bool,
-    pub actor: u32,
-    pub location: Point<i32>,
-}
-
-#[derive(Debug)]
-pub struct FlaggedInt {
-    pub unknown: bool,
-    pub value: i32,
-}
-
-#[derive(Debug)]
-pub struct Loadout {
-    pub version: u8,
-    pub body: u32,
-    pub decal: u32,
-    pub wheels: u32,
-    pub rocket_boost: u32,
-    pub antenna: u32,
-    pub topper: u32,
-    pub unknown1: u32,
-    pub unknown2: Option<u32>,
-    pub engine: Option<u32>,
-    pub trail: Option<u32>,
-    pub goal: Option<u32>,
-    pub banner: Option<u32>,
-}
-
-#[derive(Debug)]
-pub struct LoadoutOnline {
-    pub products: Vec<Vec<Product>>,
-}
-
-#[derive(Debug)]
-pub struct Product {
-    pub unknown: bool,
-    pub object_id: u32,
-    pub object: Option<Text>,
-    pub value: ProductValue,
-}
-
-#[derive(Debug)]
-pub enum ProductValue {
-    PaintedOld(U32C),
-    Painted(u32),
-    UserColor(U32C),
-}
-
-#[derive(Debug)]
-pub struct UniqueId {
-    pub system: u8,
-    pub remote: RemoteId,
-    pub local: u8,
-}
-
-#[derive(Debug)]
-pub enum RemoteId {
-    Local(u32),
-    PlayStation { name: Text, id: Vec<u8> },
-    Steam(u64),
-    Switch(Vec<bool>),
-    Xbox(u64),
-}
-
-#[derive(Debug)]
-pub struct Message {
-    pub frame: u32,
-    pub label: Text,
-    pub value: Text,
-}
-
-#[derive(Debug)]
-pub struct Mark {
-    pub value: Text,
-    pub frame: u32,
-}
-
-#[derive(Debug)]
-pub struct Class {
-    pub name: Text,
-    pub id: u32,
-}
-
-#[derive(Debug)]
-pub struct Cache {
-    pub class: u32,
-    pub parent: u32,
-    pub id: u32,
-    pub objects: List<Object>,
-}
-
-#[derive(Debug)]
-pub struct Object {
-    pub object: u32,
-    pub id: u32,
-}
-
-//
-
-pub struct Decoder {
-    pub bytes: Vec<u8>,
-    pub index: usize,
-}
-
-pub type DecoderFn<T> = fn(&mut Decoder) -> DecoderResult<T>;
-
-pub type DecoderResult<T> = Result<T, DecoderError>;
-
-#[derive(Debug)]
-pub enum DecoderError {
-    IndexOutOfBounds { index: usize, len: usize },
-    InvalidCrc { expected: u32, actual: u32 },
-    InvalidUtf16(Vec<u8>),
-    InvalidWindows1252(Vec<u8>),
-    NotImplemented,
-    UnknownProperty(String),
-}
-
-impl Decoder {
-    pub fn new(bytes: &[u8]) -> Self {
-        Decoder {
-            bytes: bytes.to_vec(),
-            index: 0,
+    ) -> BitGetResult<ReplicationValue> {
+        let is_open = self.get_bool()?;
+        if is_open {
+            let is_new = self.get_bool()?;
+            if is_new {
+                self.get_replication_value_created(context)
+            } else {
+                self.get_replication_value_updated(context, actor)
+            }
+        } else {
+            self.get_replication_value_destroyed()
         }
     }
 
-    pub fn get_option<T>(
+    fn get_replication_value_created(
         &mut self,
-        condition: bool,
-        get_value: DecoderFn<T>,
-    ) -> DecoderResult<Option<T>> {
+        context: &Context,
+    ) -> BitGetResult<ReplicationValue> {
+        let unknown = self.get_bool()?;
+        let name_index = self.get_option(context.version >= (868, 14, 0), Self::get_u32)?;
+        let name = match name_index {
+            None => Ok(None),
+            Some(index) => match context.names.get(u32_usize(index)) {
+                None => Err(BitGetError::UnknownNameIndex(index)),
+                Some(name) => Ok(Some(name.clone())),
+            },
+        }?;
+        let object_index = self.get_u32()?;
+        let object = match context.objects.get(u32_usize(object_index)) {
+            None => Err(BitGetError::UnknownObjectIndex(object_index)),
+            Some(name) => Ok(name.clone()),
+        }?;
+        let (class_id, class) = match context.classes.range(0..object_index).next_back() {
+            None => Err(BitGetError::UnknownObjectClass(object_index)),
+            Some((&id, name)) => Ok((id, name.clone())),
+        }?;
+        let location = self.get_option(context.has_location(&class), Self::get_location)?;
+        let rotation = self.get_option(context.has_rotation(&class), Self::get_rotation)?;
+        Ok(ReplicationValue::Created {
+            unknown,
+            name_index,
+            name,
+            object_index,
+            object,
+            class_id,
+            class,
+            location,
+            rotation,
+        })
+    }
+
+    fn get_replication_value_updated(
+        &mut self,
+        context: &Context,
+        actor: u32,
+    ) -> BitGetResult<ReplicationValue> {
+        let attributes = self.get_attributes(context, actor)?;
+        Ok(ReplicationValue::Updated(attributes))
+    }
+
+    fn get_replication_value_destroyed(&mut self) -> BitGetResult<ReplicationValue> {
+        Ok(ReplicationValue::Destroyed)
+    }
+}
+
+#[derive(Debug)]
+struct Location {
+    size: U32C,
+    x: U32C,
+    y: U32C,
+    z: U32C,
+}
+
+impl BitGet {
+    fn get_location(&mut self) -> BitGetResult<Location> {
+        let size = self.get_u32c(19)?;
+        let limit = 4 << size.value;
+        let x = self.get_u32c(limit)?;
+        let y = self.get_u32c(limit)?;
+        let z = self.get_u32c(limit)?;
+        Ok(Location { size, x, y, z })
+    }
+}
+
+#[derive(Debug)]
+struct Rotation {
+    x: Option<i8>,
+    y: Option<i8>,
+    z: Option<i8>,
+}
+
+impl BitGet {
+    fn get_rotation(&mut self) -> BitGetResult<Rotation> {
+        let has_x = self.get_bool()?;
+        let x = self.get_option(has_x, Self::get_i8)?;
+        let has_y = self.get_bool()?;
+        let y = self.get_option(has_y, Self::get_i8)?;
+        let has_z = self.get_bool()?;
+        let z = self.get_option(has_z, Self::get_i8)?;
+        Ok(Rotation { x, y, z })
+    }
+}
+
+#[derive(Debug)]
+struct Attribute {}
+
+impl BitGet {
+    fn get_attributes(&mut self, context: &Context, actor: u32) -> BitGetResult<Vec<Attribute>> {
+        let mut attributes = Vec::new();
+        loop {
+            let has_more = self.get_bool()?;
+            if has_more {
+                let attribute = self.get_attribute(context, actor)?;
+                attributes.push(attribute)
+            } else {
+                break;
+            }
+        }
+        Ok(attributes)
+    }
+
+    fn get_attribute(&mut self, context: &Context, actor: u32) -> BitGetResult<Attribute> {
+        let class_id = match context.get_actor_class_id(actor) {
+            None => Err(BitGetError::UnknownActor(actor)),
+            Some(id) => Ok(id),
+        }?;
+        Err(BitGetError::NotImplemented) // TODO
+    }
+}
+
+impl Get {
+    fn get_f32(&mut self) -> GetResult<f32> {
+        let x = self.get_u32()?;
+        Ok(u32_f32(x))
+    }
+
+    fn get_i32(&mut self) -> GetResult<i32> {
+        let x = self.get_u32()?;
+        Ok(u32_i32(x))
+    }
+
+    fn get_option<F, T>(&mut self, condition: bool, get_value: F) -> GetResult<Option<T>>
+    where
+        F: Fn(&mut Self) -> GetResult<T>,
+    {
         if condition {
             let value = get_value(self)?;
             Ok(Some(value))
@@ -627,66 +911,178 @@ impl Decoder {
         }
     }
 
-    pub fn get_f32(&mut self) -> DecoderResult<f32> {
-        let x = self.get_u32()?;
-        Ok(f32::from_bits(x))
+    fn get_u8(&mut self) -> GetResult<u8> {
+        let x = self.get_vec(1)?;
+        Ok(x[0])
     }
 
-    pub fn get_i32(&mut self) -> DecoderResult<i32> {
-        let x = self.get_u32()?;
-        Ok(x as i32)
-    }
-
-    pub fn get_u64(&mut self) -> DecoderResult<u64> {
-        let lower = self.get_u32()?;
-        let upper = self.get_u32()?;
-        Ok(u64::from(lower) | u64::from(upper) << 32)
-    }
-
-    pub fn get_u32(&mut self) -> DecoderResult<u32> {
-        let lower = self.get_u16()?;
-        let upper = self.get_u16()?;
-        Ok(u32::from(lower) | u32::from(upper) << 16)
-    }
-
-    pub fn get_u16(&mut self) -> DecoderResult<u16> {
+    fn get_u16(&mut self) -> GetResult<u16> {
         let lower = self.get_u8()?;
         let upper = self.get_u8()?;
-        Ok(u16::from(lower) | u16::from(upper) << 8)
+        Ok(u8_u16(lower) | u8_u16(upper) << 8)
     }
 
-    pub fn get_u8(&mut self) -> DecoderResult<u8> {
-        let bytes = self.get_bytes(1)?;
-        Ok(bytes[0])
+    fn get_u32(&mut self) -> GetResult<u32> {
+        let lower = self.get_u16()?;
+        let upper = self.get_u16()?;
+        Ok(u16_u32(lower) | u16_u32(upper) << 16)
     }
 
-    pub fn get_bytes(&mut self, size: usize) -> DecoderResult<Vec<u8>> {
-        let bytes = self.peek_bytes(size)?;
-        self.index += size;
+    fn get_u64(&mut self) -> GetResult<u64> {
+        let lower = self.get_u32()?;
+        let upper = self.get_u32()?;
+        Ok(u32_u64(lower) | u32_u64(upper) << 32)
+    }
+
+    fn get_vec(&mut self, len: usize) -> GetResult<Vec<u8>> {
+        let bytes = self.peek_vec(len)?;
+        self.index += len;
         Ok(bytes)
     }
 
-    pub fn peek_bytes(&self, size: usize) -> DecoderResult<Vec<u8>> {
-        let end = self.index + size;
-        match self.bytes.get(self.index..end) {
-            Some(bytes) => Ok(bytes.to_vec()),
-            None => Err(DecoderError::IndexOutOfBounds {
-                index: end,
+    fn peek_vec(&self, len: usize) -> GetResult<Vec<u8>> {
+        let index = self.index + len;
+        match self.bytes.get(self.index..index) {
+            None => Err(GetError::IndexOutOfBounds {
+                index,
                 len: self.bytes.len(),
             }),
+            Some(bytes) => Ok(bytes.to_vec()),
         }
     }
 }
 
-pub fn compute_crc_32(bytes: &[u8]) -> u32 {
-    let mut crc = 0x1034_0dfe;
-    for byte in bytes {
-        crc = (crc << 8) ^ CRC_32[(byte ^ ((crc >> 24) as u8)) as usize]
+impl BitGet {
+    fn get_bool(&mut self) -> BitGetResult<bool> {
+        match self.bytes.get(self.byte_index) {
+            None => Err(BitGetError::IndexOutOfBounds {
+                index: self.byte_index,
+                len: self.bytes.len(),
+            }),
+            Some(byte) => {
+                let bit = byte & 1 << self.bit_index != 0;
+                self.bit_index += 1;
+                if self.bit_index == 8 {
+                    self.bit_index = 0;
+                    self.byte_index += 1;
+                }
+                Ok(bit)
+            }
+        }
     }
-    !crc
+
+    fn get_f32(&mut self) -> BitGetResult<f32> {
+        let x = self.get_u32()?;
+        Ok(u32_f32(x))
+    }
+
+    fn get_i8(&mut self) -> BitGetResult<i8> {
+        let x = self.get_u8()?;
+        Ok(u8_i8(x))
+    }
+
+    fn get_option<F, T>(&mut self, condition: bool, get_value: F) -> BitGetResult<Option<T>>
+    where
+        F: Fn(&mut Self) -> BitGetResult<T>,
+    {
+        if condition {
+            let value = get_value(self)?;
+            Ok(Some(value))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn get_u8(&mut self) -> BitGetResult<u8> {
+        let a = self.get_bool()?;
+        let b = self.get_bool()?;
+        let c = self.get_bool()?;
+        let d = self.get_bool()?;
+        let e = self.get_bool()?;
+        let f = self.get_bool()?;
+        let g = self.get_bool()?;
+        let h = self.get_bool()?;
+        #[cfg_attr(rustfmt, rustfmt_skip)]
+        Ok(
+            if a { 0b0000_0001 } else { 0 } |
+            if b { 0b0000_0010 } else { 0 } |
+            if c { 0b0000_0100 } else { 0 } |
+            if d { 0b0000_1000 } else { 0 } |
+            if e { 0b0001_0000 } else { 0 } |
+            if f { 0b0010_0000 } else { 0 } |
+            if g { 0b0100_0000 } else { 0 } |
+            if h { 0b1000_0000 } else { 0 },
+        )
+    }
+
+    fn get_u16(&mut self) -> BitGetResult<u16> {
+        let lower = self.get_u8()?;
+        let upper = self.get_u8()?;
+        Ok(u8_u16(lower) | u8_u16(upper) << 8)
+    }
+
+    fn get_u32(&mut self) -> BitGetResult<u32> {
+        let lower = self.get_u16()?;
+        let upper = self.get_u16()?;
+        Ok(u16_u32(lower) | u16_u32(upper) << 16)
+    }
 }
 
-pub const CRC_32: [u32; 256] = [
+fn i32_usize(x: i32) -> usize {
+    x as usize
+}
+
+fn u8_i8(x: u8) -> i8 {
+    x as i8
+}
+
+fn u8_u16(x: u8) -> u16 {
+    u16::from(x)
+}
+
+fn u8_usize(x: u8) -> usize {
+    x as usize
+}
+
+fn u16_u32(x: u16) -> u32 {
+    u32::from(x)
+}
+
+fn u32_f32(x: u32) -> f32 {
+    f32::from_bits(x)
+}
+
+fn u32_i32(x: u32) -> i32 {
+    x as i32
+}
+
+fn u32_u8(x: u32) -> u8 {
+    x as u8
+}
+
+fn u32_u64(x: u32) -> u64 {
+    u64::from(x)
+}
+
+fn u32_usize(x: u32) -> usize {
+    x as usize
+}
+
+fn u64_f64(x: u64) -> f64 {
+    x as f64
+}
+
+fn usize_f64(x: usize) -> f64 {
+    x as f64
+}
+
+fn crc_32(bytes: &[u8]) -> u32 {
+    !bytes.iter().fold(0x1034_0dfe, |crc, byte| {
+        crc << 8 ^ CRC_32[u8_usize(byte ^ u32_u8(crc >> 24))]
+    })
+}
+
+const CRC_32: [u32; 256] = [
     0x0000_0000,
     0x04c1_1db7,
     0x0982_3b6e,
@@ -945,18 +1341,13 @@ pub const CRC_32: [u32; 256] = [
     0xb1f7_40b4,
 ];
 
-pub fn decode_windows_1252(bytes: &[u8]) -> Option<String> {
-    let mut string = String::with_capacity(bytes.len());
-    for byte in bytes {
-        match WINDOWS_1252[*byte as usize] {
-            Some(c) => string.push(c),
-            None => return None,
-        }
-    }
-    Some(string)
+fn windows_1252(bytes: &[u8]) -> Option<String> {
+    bytes
+        .iter()
+        .map(|&byte| WINDOWS_1252[u8_usize(byte)])
+        .collect()
 }
 
-// https://www.unicode.org/Public/MAPPINGS/VENDORS/MICSFT/WINDOWS/CP1252.TXT
 const WINDOWS_1252: [Option<char>; 256] = [
     // 0x0_
     Some('\u{0000}'), // null
@@ -1232,12 +1623,12 @@ const WINDOWS_1252: [Option<char>; 256] = [
     Some('\u{00ff}'), // latin small letter y with diaeresis
 ];
 
-pub fn decode_utf_16(bytes: &[u8]) -> Option<String> {
+fn utf_16(bytes: &[u8]) -> Option<String> {
     let mut units = Vec::with_capacity(bytes.len() / 2);
     for chunk in bytes.chunks(2) {
-        let lower = u16::from(chunk[0]);
+        let lower = u8_u16(chunk[0]);
         match chunk.get(1) {
-            Some(upper) => units.push(lower | u16::from(*upper) << 8),
+            Some(&upper) => units.push(lower | u8_u16(upper) << 8),
             None => return None,
         }
     }
