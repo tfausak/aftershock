@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 
 type GetResult<T> = Result<T, GetError>;
 
@@ -30,11 +31,14 @@ type BitGetResult<T> = Result<T, BitGetError>;
 #[derive(Debug)]
 pub enum BitGetError {
     IndexOutOfBounds { index: usize, len: usize },
-    NotImplemented,
     UnknownActor(u32),
-    UnknownNameIndex(u32),
-    UnknownObjectClass(u32),
-    UnknownObjectIndex(u32),
+    UnknownAttribute(String),
+    UnknownAttributeIndex(u32),
+    UnknownClass(u32),
+    UnknownName(u32),
+    UnknownObject(u32),
+    UnknownObjectClass(String),
+    UnknownStreamId(u32),
 }
 
 struct BitGet {
@@ -326,8 +330,10 @@ impl Get {
         let names = self.get_list(Self::get_text)?;
         let classes = self.get_list(Self::get_class)?;
         let caches = self.get_list(Self::get_cache)?;
-        let frames =
-            Self::get_frames(bytes, &mut Context::new(header, &names, &objects, &classes))?;
+        let frames = Self::get_frames(
+            bytes,
+            &mut Context::new(header, &names, &objects, &classes, &caches),
+        )?;
         Ok(Content {
             levels,
             keyframes,
@@ -459,6 +465,7 @@ struct Context {
     classes_with_location: HashSet<&'static str>,
     classes_with_rotation: HashSet<&'static str>,
     actors: HashMap<u32, u32>,
+    attributes: HashMap<u32, BTreeMap<u32, u32>>,
 }
 
 impl Context {
@@ -467,6 +474,7 @@ impl Context {
         names: &List<Text>,
         objects: &List<Text>,
         classes: &List<Class>,
+        caches: &List<Cache>,
     ) -> Self {
         Context {
             num_frames: Self::get_num_frames(header),
@@ -478,6 +486,7 @@ impl Context {
             classes_with_location: Self::get_classes_with_location(),
             classes_with_rotation: Self::get_classes_with_rotation(),
             actors: HashMap::new(),
+            attributes: Self::get_attributes(caches),
         }
     }
 
@@ -604,6 +613,51 @@ impl Context {
             None => None,
             Some(&id) => Some(id),
         }
+    }
+
+    fn get_attributes(caches: &List<Cache>) -> HashMap<u32, BTreeMap<u32, u32>> {
+        let mut class_index_to_class_id: VecDeque<(u32, u32)> = VecDeque::new();
+        let mut class_id_to_parent_class_id = HashMap::new();
+        let mut class_id_to_attributes = HashMap::new();
+
+        for cache in &caches.value {
+            let mut attributes: BTreeMap<u32, u32> = cache
+                .objects
+                .value
+                .iter()
+                .map(|x| (x.id, x.index))
+                .collect();
+
+            let parent = match class_index_to_class_id.iter().find(|x| x.0 == cache.parent) {
+                Some(x) => {
+                    class_id_to_parent_class_id.insert(cache.class, x.1);
+                    Some(x.1)
+                }
+                None => match class_index_to_class_id.iter().find(|x| x.0 <= cache.parent) {
+                    Some(x) => {
+                        class_id_to_parent_class_id.insert(cache.class, x.1);
+                        Some(x.1)
+                    }
+                    None => None,
+                },
+            };
+
+            if let Some(parent_class_id) = parent {
+                if let Some(parent_attributes) = class_id_to_attributes.get(&parent_class_id) {
+                    attributes.extend(parent_attributes)
+                }
+            };
+
+            class_id_to_attributes.insert(cache.class, attributes);
+
+            class_index_to_class_id.push_front((cache.index, cache.class));
+        }
+
+        class_id_to_attributes
+    }
+
+    fn get_class_attributes(&self, class: u32) -> Option<BTreeMap<u32, u32>> {
+        self.attributes.get(&class).cloned()
     }
 }
 
@@ -750,17 +804,17 @@ impl BitGet {
         let name = match name_index {
             None => Ok(None),
             Some(index) => match context.names.get(u32_usize(index)) {
-                None => Err(BitGetError::UnknownNameIndex(index)),
+                None => Err(BitGetError::UnknownName(index)),
                 Some(name) => Ok(Some(name.clone())),
             },
         }?;
         let object_index = self.get_u32()?;
         let object = match context.objects.get(u32_usize(object_index)) {
-            None => Err(BitGetError::UnknownObjectIndex(object_index)),
+            None => Err(BitGetError::UnknownObject(object_index)),
             Some(name) => Ok(name.clone()),
         }?;
         let (class_id, class) = match context.classes.range(0..object_index).next_back() {
-            None => Err(BitGetError::UnknownObjectClass(object_index)),
+            None => Err(BitGetError::UnknownObjectClass(object.clone())),
             Some((&id, name)) => Ok((id, name.clone())),
         }?;
         let location = self.get_option(context.has_location(&class), Self::get_location)?;
@@ -831,7 +885,13 @@ impl BitGet {
 }
 
 #[derive(Debug)]
-struct Attribute {}
+struct Attribute {
+    class_id: u32, // RO
+    stream_id: U32C,
+    object_id: u32, // RO
+    object: String, // RO
+    value: AttributeValue,
+}
 
 impl BitGet {
     fn get_attributes(&mut self, context: &Context, actor: u32) -> BitGetResult<Vec<Attribute>> {
@@ -853,7 +913,41 @@ impl BitGet {
             None => Err(BitGetError::UnknownActor(actor)),
             Some(id) => Ok(id),
         }?;
-        Err(BitGetError::NotImplemented) // TODO
+        let attributes = match context.get_class_attributes(class_id) {
+            Some(x) => Ok(x),
+            None => Err(BitGetError::UnknownClass(class_id)),
+        }?;
+        let limit = match attributes.keys().next_back() {
+            Some(&x) => x,
+            None => 0,
+        };
+        let stream_id = self.get_u32c(limit)?;
+        let object_id = match attributes.get(&stream_id.value) {
+            Some(&x) => Ok(x),
+            None => Err(BitGetError::UnknownStreamId(stream_id.value)),
+        }?;
+        let object = match context.objects.get(u32_usize(object_id)) {
+            Some(x) => Ok(x.clone()),
+            None => Err(BitGetError::UnknownAttributeIndex(object_id)),
+        }?;
+        let value = self.get_attribute_value(&object)?;
+        Ok(Attribute {
+            class_id,
+            stream_id,
+            object_id,
+            object,
+            value,
+        })
+    }
+}
+
+#[derive(Debug)]
+enum AttributeValue {}
+
+impl BitGet {
+    fn get_attribute_value(&mut self, name: &str) -> BitGetResult<AttributeValue> {
+        // TODO
+        Err(BitGetError::UnknownAttribute(String::from(name)))
     }
 }
 
